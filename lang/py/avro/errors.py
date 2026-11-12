@@ -123,6 +123,19 @@ class ConnectionClosedException(AvroException):
     """Raised when attempting IPC on a closed connection."""
 
 
+class AvroFrameSizeException(AvroException):
+    """Raised when a single framed IPC buffer declares more than the frame limit.
+
+    The limit is checked against the declared length before any payload bytes
+    are read, so a malformed length cannot trigger a huge allocation.
+    """
+
+
+class AvroMessageSizeException(AvroException):
+    """Raised when the cumulative payload of a framed IPC message exceeds the
+    message limit before its zero-length terminating frame is seen."""
+
+
 class ProtocolParseException(AvroException):
     """Raised when a protocol failed to parse."""
 

@@ -61,6 +61,13 @@ BIG_ENDIAN_INT_STRUCT = struct.Struct("!I")
 BUFFER_HEADER_LENGTH = 4
 BUFFER_SIZE = 8192
 
+# Default defensive limits for framed IPC reads. A single frame (buffer) may
+# not declare more than MAX_FRAME_SIZE bytes, and the frames of one message
+# may not carry more than MAX_MESSAGE_SIZE bytes of payload in total. Both
+# are configurable per FramedReader; pass None to disable a limit.
+MAX_FRAME_SIZE = 1 << 20  # 1 MiB
+MAX_MESSAGE_SIZE = 16 << 20  # 16 MiB
+
 #
 # Base IPC Classes (Requestor/Responder)
 #
@@ -386,39 +393,123 @@ class Responder:
 
 
 class FramedReader:
-    """Wrapper around a file-like object to read framed data."""
+    """Wrapper around a file-like object to read framed data.
 
-    def __init__(self, reader):
+    A message is a sequence of length-prefixed frames terminated by a
+    zero-length frame. This reader is hardened for channels that may return
+    fewer bytes than requested and for hostile length prefixes:
+
+    * ``read_framed_message`` returns ``None`` if the channel reaches a clean
+      EOF at a message boundary (before any length prefix is seen).
+    * It raises ``avro.errors.ConnectionClosedException`` if EOF occurs
+      while reading a length prefix or a frame payload.
+    * It raises ``avro.errors.AvroFrameSizeException`` if a frame declares
+      more than ``max_frame_size`` bytes, and
+      ``avro.errors.AvroMessageSizeException`` if the accumulated payload
+      exceeds ``max_message_size``. Both are detected from the declared
+      length before any payload bytes are read.
+
+    After any exception the reader is permanently broken: the stream position
+    is unknown, so it refuses to guess and raises
+    ``avro.errors.ConnectionClosedException`` on further read attempts. There
+    is no automatic recovery to a later message.
+    """
+
+    def __init__(self, reader, max_frame_size=MAX_FRAME_SIZE, max_message_size=MAX_MESSAGE_SIZE):
         self._reader = reader
+        self._max_frame_size = max_frame_size
+        self._max_message_size = max_message_size
+        self._broken = None
 
     # read-only properties
     @property
     def reader(self):
         return self._reader
 
+    @property
+    def max_frame_size(self):
+        return self._max_frame_size
+
+    @property
+    def max_message_size(self):
+        return self._max_message_size
+
     def read_framed_message(self):
+        if self._broken is not None:
+            raise avro.errors.ConnectionClosedException(f"FramedReader is unusable after a previous failure: {self._broken}")
+
         message = []
+        message_length = 0
         while True:
-            buffer = io.BytesIO()
-            buffer_length = self._read_buffer_length()
-            if buffer_length == 0:
-                return b"".join(message)
-            while buffer.tell() < buffer_length:
-                chunk = self.reader.read(buffer_length - buffer.tell())
-                if chunk == b"":
-                    raise avro.errors.ConnectionClosedException("Reader read 0 bytes.")
-                buffer.write(chunk)
-            message.append(buffer.getvalue())
+            try:
+                buffer_length = self._read_buffer_length()
+                if buffer_length is None:
+                    # Clean EOF at a message boundary, before any frame was seen.
+                    if message:
+                        raise avro.errors.ConnectionClosedException(
+                            "Unexpected EOF between frames: message was not terminated by a zero-length frame."
+                        )
+                    return None
+                if buffer_length == 0:
+                    return b"".join(message)
+                if self._max_frame_size is not None and buffer_length > self._max_frame_size:
+                    raise avro.errors.AvroFrameSizeException(
+                        f"Frame declares {buffer_length} bytes, exceeding max_frame_size of {self._max_frame_size}."
+                    )
+                if self._max_message_size is not None and message_length + buffer_length > self._max_message_size:
+                    raise avro.errors.AvroMessageSizeException(
+                        f"Message declares at least {message_length + buffer_length} bytes, "
+                        f"exceeding max_message_size of {self._max_message_size}."
+                    )
+                message.append(self._read_buffer_payload(buffer_length))
+                message_length += buffer_length
+            except avro.errors.AvroException as e:
+                self._broken = e
+                raise
 
     def _read_buffer_length(self):
-        read = self.reader.read(BUFFER_HEADER_LENGTH)
-        if read == b"":
-            raise avro.errors.ConnectionClosedException("Reader read 0 bytes.")
-        return BIG_ENDIAN_INT_STRUCT.unpack(read)[0]
+        length_bytes = self._read_exactly(BUFFER_HEADER_LENGTH)
+        if length_bytes is None:
+            return None
+        return BIG_ENDIAN_INT_STRUCT.unpack(length_bytes)[0]
+
+    def _read_buffer_payload(self, buffer_length):
+        payload = self._read_exactly(buffer_length)
+        if payload is None:
+            raise avro.errors.ConnectionClosedException(
+                f"Unexpected EOF in frame payload: expected {buffer_length} bytes."
+            )
+        return payload
+
+    def _read_exactly(self, length):
+        """Read exactly ``length`` bytes, tolerating short reads.
+
+        Returns None only if EOF is hit before any byte of the request was
+        read. EOF after a partial read is reported as truncation.
+        """
+        chunks = []
+        received = 0
+        while received < length:
+            chunk = self.reader.read(length - received)
+            if not chunk:
+                if received == 0:
+                    return None
+                raise avro.errors.ConnectionClosedException(
+                    f"Unexpected EOF: expected {length} bytes, read {received}."
+                )
+            chunks.append(chunk)
+            received += len(chunk)
+        return b"".join(chunks)
 
 
 class FramedWriter:
-    """Wrapper around a file-like object to write framed data."""
+    """Wrapper around a file-like object to write framed data.
+
+    Handles channels whose ``write`` accepts only part of the buffer by
+    retrying until every byte is sent. A write that reports zero (or
+    negative) progress raises ``avro.errors.ConnectionClosedException``
+    instead of looping forever.
+    """
 
     def __init__(self, writer):
         self._writer = writer
@@ -444,10 +535,26 @@ class FramedWriter:
     def write_buffer(self, chunk):
         buffer_length = len(chunk)
         self.write_buffer_length(buffer_length)
-        self.writer.write(chunk)
+        self._write_all(chunk)
 
     def write_buffer_length(self, n):
-        self.writer.write(BIG_ENDIAN_INT_STRUCT.pack(n))
+        self._write_all(BIG_ENDIAN_INT_STRUCT.pack(n))
+
+    def _write_all(self, data):
+        """Write all of ``data``, retrying partial writes."""
+        offset = 0
+        length = len(data)
+        while offset < length:
+            written = self.writer.write(data[offset:])
+            if written is None:
+                # Buffered file objects typically return None only when the
+                # payload was empty; treat anything longer as unverifiable.
+                if offset == 0 and length == 0:
+                    return
+                raise avro.errors.ConnectionClosedException("Writer accepted no bytes; connection is unusable.")
+            if written <= 0:
+                raise avro.errors.ConnectionClosedException(f"Writer made no progress (reported {written} bytes written); connection is unusable.")
+            offset += written
 
 
 #
@@ -476,6 +583,8 @@ class HTTPTransceiver:
         response = self.conn.getresponse()
         response_reader = FramedReader(response)
         framed_message = response_reader.read_framed_message()
+        if framed_message is None:
+            raise avro.errors.ConnectionClosedException("Server closed the connection without sending a response.")
         response.read()  # ensure we're ready for subsequent requests
         return framed_message
 
