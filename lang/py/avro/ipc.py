@@ -115,18 +115,37 @@ class BaseRequestor:
     def request(self, message_name, request_datum):
         """
         Writes a request message and reads a response or error message.
+
+        One-way messages return ``None`` once the request has been sent. On a
+        connected, stateful transceiver no call response is expected. On a
+        stateless transceiver the transport-level response is still consumed.
         """
+        message = self.local_protocol.messages.get(message_name)
+        if message is None:
+            raise avro.errors.AvroException(f"Unknown message: {message_name}")
+
         # build handshake and call request
         buffer_writer = io.BytesIO()
         buffer_encoder = avro.io.BinaryEncoder(buffer_writer)
         self.write_handshake_request(buffer_encoder)
         self.write_call_request(message_name, request_datum, buffer_encoder)
 
-        # send the handshake and call request; block until call response
         call_request = buffer_writer.getvalue()
-        return self.issue_request(call_request, message_name, request_datum)
+        connected = getattr(self.transceiver, "is_connected", False)
+        if message.one_way and connected:
+            remote_message = self.remote_protocol.messages.get(message_name) if self.remote_protocol else None
+            if remote_message is not None and not remote_message.one_way:
+                raise avro.errors.AvroException(f"Not both one-way messages: {message_name}")
+            self.transceiver.write_framed_message(call_request)
+            return None
+
+        # send the handshake and call request; block until call response
+        result = self.issue_request(call_request, message_name, request_datum, connected)
+        return result
 
     def write_handshake_request(self, encoder):
+        if getattr(self.transceiver, "is_connected", False):
+            return
         local_hash = self.local_protocol.md5
         remote_name = self.transceiver.remote_name
         remote_hash = REMOTE_HASHES.get(remote_name)
@@ -188,7 +207,7 @@ class BaseRequestor:
         else:
             raise avro.errors.AvroException(f"Unexpected match: {match}")
 
-    def read_call_response(self, message_name, decoder):
+    def read_call_response(self, message_name, decoder, was_connected=False):
         """
         The format of a call response is:
           * response metadata, a map with values of type bytes
@@ -211,6 +230,11 @@ class BaseRequestor:
         if local_message_schema is None:
             raise avro.errors.AvroException(f"Unknown local message: {message_name}")
 
+        if local_message_schema.one_way != remote_message_schema.one_way and was_connected:
+            raise avro.errors.AvroException(f"Not both one-way messages: {message_name}")
+        if local_message_schema.one_way and was_connected:
+            return None
+
         # error flag
         if not decoder.read_boolean():
             writers_schema = remote_message_schema.response
@@ -229,14 +253,14 @@ class BaseRequestor:
 
 
 class Requestor(BaseRequestor):
-    def issue_request(self, call_request, message_name, request_datum):
+    def issue_request(self, call_request, message_name, request_datum, was_connected=False):
         call_response = self.transceiver.transceive(call_request)
 
         # process the handshake and call response
         buffer_decoder = avro.io.BinaryDecoder(io.BytesIO(call_response))
-        call_response_exists = self.read_handshake_response(buffer_decoder)
+        call_response_exists = True if was_connected else self.read_handshake_response(buffer_decoder)
         if call_response_exists:
-            return self.read_call_response(message_name, buffer_decoder)
+            return self.read_call_response(message_name, buffer_decoder, was_connected)
         return self.request(message_name, request_datum)
 
 
@@ -269,10 +293,14 @@ class Responder:
     def set_protocol_cache(self, hash, protocol):
         self.protocol_cache[hash] = protocol
 
-    def respond(self, call_request):
+    def respond(self, call_request, connection=None):
         """
         Called by a server to deserialize a request, compute and serialize
         a response or error. Compare to 'handle()' in Thrift.
+
+        A connected stateful transceiver receives no response data for a
+        one-way message. Stateless transceivers still receive the normal
+        null response so the transport can complete its request.
         """
         buffer_reader = io.BytesIO(call_request)
         buffer_decoder = avro.io.BinaryDecoder(buffer_reader)
@@ -280,9 +308,10 @@ class Responder:
         buffer_encoder = avro.io.BinaryEncoder(buffer_writer)
         error = None
         response_metadata = {}
+        was_connected = connection is not None and getattr(connection, "is_connected", False)
 
         try:
-            remote_protocol = self.process_handshake(buffer_decoder, buffer_encoder)
+            remote_protocol = self.process_handshake(buffer_decoder, buffer_encoder, connection)
             # handshake failure
             if remote_protocol is None:
                 return buffer_writer.getvalue()
@@ -301,6 +330,8 @@ class Responder:
             if local_message is None:
                 fail_msg = f"Unknown local message: {remote_message_name}"
                 raise avro.errors.AvroException(fail_msg)
+            if local_message.one_way != remote_message.one_way and was_connected:
+                raise avro.errors.AvroException(f"Not both one-way messages: {remote_message_name}")
             writers_schema = remote_message.request
             readers_schema = local_message.request
             request = self.read_request(writers_schema, readers_schema, buffer_decoder)
@@ -313,6 +344,9 @@ class Responder:
             except Exception as e:
                 error = avro.errors.AvroRemoteException(str(e))
 
+            if local_message.one_way and was_connected:
+                return None
+
             # write response using local protocol
             META_WRITER.write(response_metadata, buffer_encoder)
             buffer_encoder.write_boolean(error is not None)
@@ -324,13 +358,20 @@ class Responder:
                 self.write_error(writers_schema, error, buffer_encoder)
         except avro.errors.AvroException as e:
             error = avro.errors.AvroRemoteException(str(e))
-            buffer_encoder = avro.io.BinaryEncoder(io.BytesIO())
+            buffer_writer = io.BytesIO()
+            buffer_encoder = avro.io.BinaryEncoder(buffer_writer)
             META_WRITER.write(response_metadata, buffer_encoder)
             buffer_encoder.write_boolean(True)
             self.write_error(SYSTEM_ERROR_SCHEMA, error, buffer_encoder)
         return buffer_writer.getvalue()
 
-    def process_handshake(self, decoder, encoder):
+    def process_handshake(self, decoder, encoder, connection=None):
+        if connection is not None and getattr(connection, "is_connected", False):
+            remote_protocol = connection.get_remote() if hasattr(connection, "get_remote") else getattr(connection, "remote_protocol", None)
+            if remote_protocol is None:
+                raise avro.errors.AvroException("Connection is marked connected without a remote protocol.")
+            return remote_protocol
+
         handshake_request = HANDSHAKE_RESPONDER_READER.read(decoder)
         handshake_response = {}
 
@@ -360,6 +401,8 @@ class Responder:
             handshake_response["serverHash"] = self.local_hash
 
         HANDSHAKE_RESPONDER_WRITER.write(handshake_response, encoder)
+        if connection is not None and handshake_response["match"] != "NONE":
+            connection.set_remote(remote_protocol)
         return remote_protocol
 
     def invoke(self, local_message, request):
@@ -455,17 +498,45 @@ class FramedWriter:
 #
 
 
-class HTTPTransceiver:
+class Transceiver:
+    """Base class for transceivers that exchange framed Avro RPC messages."""
+
+    @property
+    def is_connected(self):
+        return False
+
+    def transceive(self, request):
+        raise NotImplementedError
+
+    def write_framed_message(self, message):
+        raise NotImplementedError
+
+    @property
+    def remote_protocol(self):
+        return getattr(self, "_remote_protocol", None)
+
+    def set_remote(self, remote_protocol):
+        self._remote_protocol = remote_protocol
+
+    def get_remote(self):
+        return self.remote_protocol
+
+
+class HTTPTransceiver(Transceiver):
     """
     A simple HTTP-based transceiver implementation.
     Useful for clients but not for servers
     """
 
-    def __init__(self, host, port, req_resource="/"):
+    def __init__(self, host, port, req_resource="/", conn=None):
         self.req_resource = req_resource
-        self.conn = http.client.HTTPConnection(host, port)
+        self.conn = conn or http.client.HTTPConnection(host, port)
         self.conn.connect()
         self.remote_name = self.conn.sock.getsockname()
+
+    @property
+    def is_connected(self):
+        return False
 
     def transceive(self, request):
         self.write_framed_message(request)

@@ -337,6 +337,39 @@ EXAMPLES = [
     ),
     ValidTestProtocol(
         {
+            "protocol": "OneWay",
+            "messages": {
+                "ack": {"request": [], "response": "null", "one-way": True},
+                "notify": {"request": [{"name": "message", "type": "string"}], "one-way": True},
+            },
+        }
+    ),
+    InvalidTestProtocol(
+        {
+            "protocol": "OneWayWithResponse",
+            "messages": {"ack": {"request": [], "response": "string", "one-way": True}},
+        }
+    ),
+    InvalidTestProtocol(
+        {
+            "protocol": "OneWayWithErrors",
+            "messages": {"ack": {"request": [], "response": "null", "errors": [], "one-way": True}},
+        }
+    ),
+    InvalidTestProtocol(
+        {
+            "protocol": "OneWayWithNonBooleanFlag",
+            "messages": {"ack": {"request": [], "response": "null", "one-way": "yes"}},
+        }
+    ),
+    InvalidTestProtocol(
+        {
+            "protocol": "MissingResponse",
+            "messages": {"hello": {"request": []}},
+        }
+    ),
+    ValidTestProtocol(
+        {
             "protocol": "API",
             "namespace": "xyz.api",
             "types": [
@@ -393,6 +426,18 @@ class TestMisc(unittest.TestCase):
         self.assertEqual("Greeting", proto.types[0].name)
         # but there shouldn't be 'namespace' rendered to json on the inner type
         self.assertNotIn("namespace", proto.to_json()["types"][0])
+
+    def test_one_way_message(self):
+        proto = ValidTestProtocol(
+            {
+                "protocol": "OneWay",
+                "messages": {"ack": {"request": [], "response": "null", "one-way": True}},
+            }
+        ).parse()
+        message = proto.messages["ack"]
+        self.assertTrue(message.one_way)
+        self.assertEqual("null", message.response.type)
+        self.assertTrue(proto.to_json()["messages"]["ack"]["one-way"])
 
 
 class ProtocolParseTestCase(unittest.TestCase):
@@ -460,6 +505,7 @@ class RoundTripParseTestCase(unittest.TestCase):
         parsed = self.test_proto.parse()
         round_trip = avro.protocol.parse(str(parsed))
         self.assertEqual(parsed, round_trip)
+        self.assertEqual(str(parsed), str(round_trip))
 
 
 def load_tests(loader, default_tests, pattern):

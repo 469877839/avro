@@ -36,10 +36,16 @@ from avro.utils import TypedDict
 VALID_TYPE_SCHEMA_TYPES = ("enum", "record", "error", "fixed")
 
 
-class MessageObject(TypedDict, total=False):
-    request: Sequence[Mapping[str, object]]
-    response: Union[str, object]
-    errors: Optional[Sequence[str]]
+MessageObject = TypedDict(
+    "MessageObject",
+    {
+        "request": Sequence[Mapping[str, object]],
+        "response": Union[str, object],
+        "errors": Optional[Sequence[str]],
+        "one-way": bool,
+    },
+    total=False,
+)
 
 
 class ProtocolObject(TypedDict, total=False):
@@ -171,23 +177,35 @@ class Message:
     The one-way parameter may only be true when the response type is "null" and no errors are listed.
     """
 
-    __slots__ = ["_errors", "_name", "_request", "_response", "_validate_names"]
+    __slots__ = ["_errors", "_name", "_one_way", "_request", "_response", "_validate_names"]
 
     def __init__(
         self,
         name: str,
         request: Sequence[Mapping[str, object]],
-        response: Union[str, object],
+        response: Optional[Union[str, object]],
         errors: Optional[Sequence[str]] = None,
         names: Optional[avro.name.Names] = None,
         validate_names: bool = True,
+        one_way: bool = False,
     ) -> None:
+        if not isinstance(one_way, bool):
+            raise avro.errors.ProtocolParseException(f"One-way property must be a boolean: {one_way}")
+        if response is None and not one_way:
+            raise avro.errors.ProtocolParseException("Two-way messages must declare a response.")
+        if one_way and errors is not None:
+            raise avro.errors.ProtocolParseException("One-way messages cannot declare errors.")
+
         self._name = name
         names = names or avro.name.Names(validate_names=validate_names)
         self._request = _parse_request(request, names, validate_names)
-        self._response = _parse_response(response, names, validate_names)
+        self._response = _parse_response(response if response is not None else "null", names, validate_names)
         self._errors = _parse_errors(errors or [], names, validate_names)
         self._validate_names = validate_names
+        self._one_way = one_way
+
+        if self._one_way and self._response.type != "null":
+            raise avro.errors.ProtocolParseException("One-way messages must have a null response.")
 
     @property
     def name(self) -> str:
@@ -205,6 +223,10 @@ class Message:
     def errors(self) -> avro.schema.ErrorUnionSchema:
         return self._errors
 
+    @property
+    def one_way(self) -> bool:
+        return self._one_way
+
     def __str__(self) -> str:
         return json.dumps(self.to_json())
 
@@ -217,8 +239,10 @@ class Message:
             to_dump = {}
         to_dump["request"] = self.request.to_json(names)
         to_dump["response"] = self.response.to_json(names)
-        if self.errors:
+        if self.errors and not self.one_way:
             to_dump["errors"] = self.errors.to_json(names)
+        if self.one_way:
+            to_dump["one-way"] = True
 
         return to_dump
 
@@ -281,7 +305,10 @@ def _parse_messages(message_objects: Mapping[str, "MessageObject"], names: avro.
         if not hasattr(body, "get"):
             raise avro.errors.ProtocolParseException(f'Message name "{name}" has non-object body {body}.')
         request = body["request"]
-        response = body["response"]
+        response = body.get("response")
         errors = body.get("errors")
-        messages[name] = Message(name, request, response, errors, names, validate_names=validate_names)
+        one_way = body.get("one-way", False)
+        messages[name] = Message(
+            name, request, response, errors, names, validate_names=validate_names, one_way=one_way
+        )
     return messages
