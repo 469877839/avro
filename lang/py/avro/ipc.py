@@ -23,6 +23,8 @@ import http.client
 import io
 import os
 import struct
+import threading
+from typing import Any, Dict, Optional
 
 import avro.errors
 import avro.io
@@ -53,13 +55,107 @@ META_READER = avro.io.DatumReader(META_SCHEMA)
 
 SYSTEM_ERROR_SCHEMA = avro.schema.parse('["string"]')
 
-# protocol cache
-REMOTE_HASHES = {}
-REMOTE_PROTOCOLS = {}
+# Deprecated module-level handshake caches, kept for backward compatibility.
+# New code should use a HandshakeCache instance instead: the module-level
+# dictionaries are keyed only by transceiver.remote_name, so two distinct
+# endpoints that happen to share a name would silently share protocol state.
+REMOTE_HASHES: Dict[Any, bytes] = {}
+REMOTE_PROTOCOLS: Dict[Any, "avro.protocol.Protocol"] = {}
 
 BIG_ENDIAN_INT_STRUCT = struct.Struct("!I")
 BUFFER_HEADER_LENGTH = 4
 BUFFER_SIZE = 8192
+
+
+class HandshakeEntry:
+    """
+    A single verified handshake result for one endpoint.
+
+    An entry is only created after a handshake has completed successfully:
+    the protocol has been parsed locally and its MD5 digest matches the hash
+    reported by the remote endpoint. Entries are immutable so they can be
+    shared safely between concurrent requestors.
+    """
+
+    __slots__ = ("_protocol", "_hash")
+
+    def __init__(self, protocol: "avro.protocol.Protocol", hash: bytes) -> None:
+        if not isinstance(protocol, avro.protocol.Protocol):
+            raise avro.errors.AvroException(f"Handshake cache entries require a Protocol, got {type(protocol).__name__}")
+        if protocol.md5 != hash:
+            raise avro.errors.AvroException("Handshake cache entry rejected: protocol MD5 does not match the remote hash")
+        self._protocol = protocol
+        self._hash = hash
+
+    @property
+    def protocol(self) -> "avro.protocol.Protocol":
+        return self._protocol
+
+    @property
+    def hash(self) -> bytes:
+        return self._hash
+
+    def __eq__(self, that: object) -> bool:
+        return isinstance(that, HandshakeEntry) and self.hash == that.hash and self.protocol == that.protocol
+
+    def __repr__(self) -> str:
+        return f"HandshakeEntry(protocol={self.protocol.fullname!r}, hash={self.hash.hex()!r})"
+
+
+class HandshakeCache:
+    """
+    Thread-safe cache of verified handshake results, keyed by endpoint identity.
+
+    The cache key is a stable endpoint identity supplied by the caller (for
+    example a URL, a ``(host, port)`` pair, or a logical service name). Each
+    requestor that does not share its cache is fully isolated: two endpoints
+    that happen to have the same ``transceiver.remote_name`` no longer leak
+    protocol state into each other.
+
+    Only protocol information that has been verified during a completed
+    handshake is stored here; a failed handshake never mutates the cache, so
+    one bad exchange cannot pollute other sessions.
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[Any, HandshakeEntry] = {}
+        self._lock = threading.RLock()
+
+    def get(self, endpoint_id: Any) -> Optional[HandshakeEntry]:
+        """Return the verified entry for ``endpoint_id``, or None."""
+        with self._lock:
+            return self._entries.get(endpoint_id)
+
+    def set(self, endpoint_id: Any, protocol: "avro.protocol.Protocol", hash: bytes) -> HandshakeEntry:
+        """
+        Store a verified handshake result for ``endpoint_id``.
+
+        The protocol's MD5 digest must equal ``hash``; otherwise the entry is
+        rejected and the cache is left untouched.
+        """
+        entry = HandshakeEntry(protocol, hash)
+        with self._lock:
+            self._entries[endpoint_id] = entry
+        return entry
+
+    def invalidate(self, endpoint_id: Any) -> bool:
+        """Drop the entry for ``endpoint_id``. Returns True if one existed."""
+        with self._lock:
+            return self._entries.pop(endpoint_id, None) is not None
+
+    def clear(self) -> None:
+        """Drop every cached handshake result."""
+        with self._lock:
+            self._entries.clear()
+
+    def __contains__(self, endpoint_id: Any) -> bool:
+        with self._lock:
+            return endpoint_id in self._entries
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
 
 #
 # Base IPC Classes (Requestor/Responder)
@@ -69,12 +165,32 @@ BUFFER_SIZE = 8192
 class BaseRequestor:
     """Base class for the client side of a protocol interaction."""
 
-    def __init__(self, local_protocol, transceiver):
+    def __init__(self, local_protocol, transceiver, handshake_cache=None, endpoint_id=None, *, cache_key=None):
+        """
+        :param local_protocol: the protocol the client speaks.
+        :param transceiver: the transport used to reach the server.
+        :param handshake_cache: optional HandshakeCache holding verified remote
+            protocols. When omitted, a private cache is created so this
+            requestor is isolated from every other endpoint, even ones whose
+            transceivers report the same remote_name. Pass a shared cache to
+            reuse handshakes across requestors.
+        :param endpoint_id: stable identity of the remote endpoint used as the
+            cache key (for example a URL or a (host, port) pair). Defaults to
+            ``transceiver.remote_name`` for backward compatibility. Callers
+            sharing a cache between endpoints must supply distinct identities.
+        :param cache_key: deprecated alias for endpoint_id.
+        """
+        if cache_key is not None:
+            if endpoint_id is not None:
+                raise avro.errors.AvroException("Specify only one of endpoint_id and cache_key")
+            endpoint_id = cache_key
         self._local_protocol = local_protocol
         self._transceiver = transceiver
+        self._handshake_cache = handshake_cache if handshake_cache is not None else HandshakeCache()
+        self._endpoint_id = endpoint_id
         self._remote_protocol = None
         self._remote_hash = None
-        self._send_protocol = None
+        self._send_protocol = False
 
     # read-only properties
     @property
@@ -85,6 +201,18 @@ class BaseRequestor:
     def transceiver(self):
         return self._transceiver
 
+    @property
+    def handshake_cache(self):
+        """The cache of verified remote protocols used by this requestor."""
+        return self._handshake_cache
+
+    @property
+    def endpoint_id(self):
+        """Stable identity of the remote endpoint, used as the cache key."""
+        if self._endpoint_id is not None:
+            return self._endpoint_id
+        return self.transceiver.remote_name
+
     # read/write properties
     @property
     def remote_protocol(self):
@@ -92,8 +220,10 @@ class BaseRequestor:
 
     @remote_protocol.setter
     def remote_protocol(self, new_remote_protocol):
+        # Only updates this requestor's view. The handshake cache is updated
+        # exclusively with protocol information verified by a completed
+        # handshake; use the cache's set()/invalidate() for explicit control.
         self._remote_protocol = new_remote_protocol
-        REMOTE_PROTOCOLS[self.transceiver.remote_name] = self.remote_protocol
 
     @property
     def remote_hash(self):
@@ -102,7 +232,6 @@ class BaseRequestor:
     @remote_hash.setter
     def remote_hash(self, new_remote_hash):
         self._remote_hash = new_remote_hash
-        REMOTE_HASHES[self.transceiver.remote_name] = self.remote_hash
 
     @property
     def send_protocol(self):
@@ -111,6 +240,17 @@ class BaseRequestor:
     @send_protocol.setter
     def send_protocol(self, new_send_protocol):
         self._send_protocol = new_send_protocol
+
+    def invalidate_handshake_cache(self):
+        """
+        Explicitly drop the verified remote protocol cached for this endpoint.
+
+        The next request re-negotiates the handshake from scratch. Useful when
+        the server is known to have changed its protocol.
+        """
+        self.handshake_cache.invalidate(self.endpoint_id)
+        self._remote_protocol = None
+        self._remote_hash = None
 
     def request(self, message_name, request_datum):
         """
@@ -128,11 +268,17 @@ class BaseRequestor:
 
     def write_handshake_request(self, encoder):
         local_hash = self.local_protocol.md5
-        remote_name = self.transceiver.remote_name
-        remote_hash = REMOTE_HASHES.get(remote_name)
-        if remote_hash is None:
+        entry = self.handshake_cache.get(self.endpoint_id)
+        if entry is not None:
+            # verified remote protocol from a previous handshake
+            remote_hash = entry.hash
+            self._remote_protocol = entry.protocol
+            self._remote_hash = entry.hash
+        else:
+            # never connected: guess the server speaks our protocol
             remote_hash = local_hash
-            self.remote_protocol = self.local_protocol
+            self._remote_protocol = None
+            self._remote_hash = None
         request_datum = {}
         request_datum["clientHash"] = local_hash
         request_datum["serverHash"] = remote_hash
@@ -165,24 +311,53 @@ class BaseRequestor:
         datum_writer = avro.io.DatumWriter(request_schema)
         datum_writer.write(request_datum, encoder)
 
+    def _parse_verified_remote(self, handshake_response):
+        """
+        Parse the server's protocol text and verify that its MD5 digest
+        matches the hash the server reported. Nothing is stored until both
+        checks pass, so an unparseable protocol or a hash mismatch cannot
+        pollute the cache or another session.
+        """
+        server_protocol_text = handshake_response.get("serverProtocol")
+        server_hash = handshake_response.get("serverHash")
+        if server_protocol_text is None or server_hash is None:
+            raise avro.errors.AvroException("Handshake response is missing the server protocol or its hash")
+        try:
+            remote_protocol = avro.protocol.parse(server_protocol_text)
+        except Exception as e:
+            raise avro.errors.AvroException(f"Handshake failure: server sent an unparseable protocol: {e}")
+        if remote_protocol.md5 != server_hash:
+            raise avro.errors.AvroException("Handshake failure: server protocol MD5 does not match the reported server hash")
+        return remote_protocol, server_hash
+
+    def _store_verified_remote(self, remote_protocol, remote_hash):
+        """Publish a verified remote protocol to both this requestor and the cache."""
+        self.handshake_cache.set(self.endpoint_id, remote_protocol, remote_hash)
+        self._remote_protocol = remote_protocol
+        self._remote_hash = remote_hash
+
     def read_handshake_response(self, decoder):
         handshake_response = HANDSHAKE_REQUESTOR_READER.read(decoder)
         match = handshake_response.get("match")
         if match == "BOTH":
+            if self._remote_protocol is None:
+                # We guessed the server protocol was our own; the server
+                # confirmed its hash, so this is now verified information.
+                self._store_verified_remote(self.local_protocol, self.local_protocol.md5)
             self.send_protocol = False
             return True
         elif match == "CLIENT":
             if self.send_protocol:
                 raise avro.errors.AvroException("Handshake failure.")
-            self.remote_protocol = avro.protocol.parse(handshake_response.get("serverProtocol"))
-            self.remote_hash = handshake_response.get("serverHash")
+            remote_protocol, remote_hash = self._parse_verified_remote(handshake_response)
+            self._store_verified_remote(remote_protocol, remote_hash)
             self.send_protocol = False
             return True
         elif match == "NONE":
             if self.send_protocol:
                 raise avro.errors.AvroException("Handshake failure.")
-            self.remote_protocol = avro.protocol.parse(handshake_response.get("serverProtocol"))
-            self.remote_hash = handshake_response.get("serverHash")
+            remote_protocol, remote_hash = self._parse_verified_remote(handshake_response)
+            self._store_verified_remote(remote_protocol, remote_hash)
             self.send_protocol = True
             return False
         else:
