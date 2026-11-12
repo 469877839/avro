@@ -19,7 +19,10 @@
 
 """Support for inter-process calls."""
 
+import abc
+import asyncio
 import http.client
+import inspect
 import io
 import os
 import struct
@@ -236,8 +239,135 @@ class Requestor(BaseRequestor):
         buffer_decoder = avro.io.BinaryDecoder(io.BytesIO(call_response))
         call_response_exists = self.read_handshake_response(buffer_decoder)
         if call_response_exists:
+            message = self.local_protocol.messages.get(message_name)
+            if message is not None and message.one_way:
+                # A successful handshake means no call response is sent.
+                return None
             return self.read_call_response(message_name, buffer_decoder)
         return self.request(message_name, request_datum)
+
+
+#
+# Asynchronous IPC
+#
+
+
+class AsyncTransceiver(abc.ABC):
+    """Interface for an asynchronous IPC transport.
+
+    Implementations only need to provide awaitable ``send``/``receive``
+    operations over a single logical connection; no concrete networking is
+    required.  Each ``send`` transmits one complete (framed) request message
+    and each ``receive`` returns one complete response message, so a
+    requestor may serialize concurrent calls over a single connection without
+    relying on request identifiers (Avro framing carries none).
+    """
+
+    @property
+    @abc.abstractmethod
+    def remote_name(self):
+        """A name identifying the remote endpoint, used for protocol caching."""
+
+    @abc.abstractmethod
+    async def send(self, request):
+        """Transmit one complete request message (bytes)."""
+
+    @abc.abstractmethod
+    async def receive(self):
+        """Return the next complete response message (bytes)."""
+
+    async def aclose(self):
+        """Release any resources held by the transceiver.
+
+        The default implementation does nothing; transports with real
+        connections should override it.
+        """
+
+
+class AsyncRequestor(BaseRequestor):
+    """Client side of a protocol interaction over an :class:`AsyncTransceiver`.
+
+    Concurrent calls made on the same requestor are serialized: Avro framing
+    carries no request identifier, so at most one exchange may be in flight
+    per connection.  A call that is cancelled while it is merely queued for
+    the connection leaves the connection usable.  Once a call has started
+    transmitting, cancelling it (or a transport failure) leaves the wire
+    state unknown -- the peer may already have executed the request -- so the
+    connection is closed and every subsequent call raises
+    :class:`avro.errors.ConnectionClosedException`.  Errors that occur after
+    a response has been fully received (including remote exceptions) do not
+    affect the connection.
+    """
+
+    def __init__(self, local_protocol, transceiver):
+        super().__init__(local_protocol, transceiver)
+        # Serializes concurrent calls: Avro framing has no request IDs, so
+        # only one exchange (handshake + call) may be in flight at a time.
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    @property
+    def closed(self):
+        """True once the connection has been abandoned after a failure."""
+        return self._closed
+
+    async def request(self, message_name, request_datum):
+        """Issue a call and return the response datum.
+
+        For one-way messages this returns ``None`` once the request has been
+        sent and the handshake has completed; no call response is awaited.
+        """
+        if self._closed:
+            raise avro.errors.ConnectionClosedException("AsyncRequestor is closed.")
+        # Queued callers may be cancelled while waiting for the lock; that
+        # happens before any bytes are sent, so the connection stays usable.
+        async with self._lock:
+            if self._closed:
+                raise avro.errors.ConnectionClosedException("AsyncRequestor is closed.")
+            return await self._call(message_name, request_datum)
+
+    async def _call(self, message_name, request_datum):
+        message = self.local_protocol.messages.get(message_name)
+        if message is None:
+            raise avro.errors.AvroException(f"Unknown message: {message_name}")
+        one_way = message.one_way
+        while True:
+            buffer_writer = io.BytesIO()
+            buffer_encoder = avro.io.BinaryEncoder(buffer_writer)
+            self.write_handshake_request(buffer_encoder)
+            self.write_call_request(message_name, request_datum, buffer_encoder)
+            try:
+                await self.transceiver.send(buffer_writer.getvalue())
+                call_response = await self.transceiver.receive()
+            except (asyncio.CancelledError, Exception):
+                # The exchange was interrupted after transmission may have
+                # started; the wire state is unknown, so the connection can
+                # no longer be trusted for further calls.
+                await self._abandon()
+                raise
+            # The full response has been consumed; decode errors and remote
+            # exceptions do not leave pending bytes on the wire.
+            buffer_decoder = avro.io.BinaryDecoder(io.BytesIO(call_response))
+            call_response_exists = self.read_handshake_response(buffer_decoder)
+            if not call_response_exists:
+                # Handshake match=NONE: resubmit with the full protocol.
+                continue
+            if one_way:
+                # The handshake succeeded, so no call response is sent.
+                return None
+            return self.read_call_response(message_name, buffer_decoder)
+
+    async def _abandon(self):
+        self._closed = True
+        aclose = getattr(self.transceiver, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            result = aclose()
+            if inspect.isawaitable(result):
+                await asyncio.shield(result)
+        except Exception:
+            pass
 
 
 class Responder:
@@ -312,6 +442,10 @@ class Responder:
                 error = e
             except Exception as e:
                 error = avro.errors.AvroRemoteException(str(e))
+
+            # One-way calls carry no response once the handshake succeeded.
+            if getattr(remote_message, "one_way", False):
+                return buffer_writer.getvalue()
 
             # write response using local protocol
             META_WRITER.write(response_metadata, buffer_encoder)

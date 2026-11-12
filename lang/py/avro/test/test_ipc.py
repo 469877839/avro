@@ -25,11 +25,30 @@ servers yet available.
 import unittest
 
 import avro.ipc
+import avro.protocol
+
+ONE_WAY_PROTOCOL = avro.protocol.parse(
+    '{"protocol": "OneWay", "messages": {"ack": {"request": [], "response": "null", "one-way": true}}}'
+)
 
 
 class TestIPC(unittest.TestCase):
     def test_placeholder(self):
         pass
+
+    def test_sync_one_way_request(self):
+        responder = avro.ipc.Responder(ONE_WAY_PROTOCOL)
+        responder.invoke = lambda message, request: None
+
+        class MemoryTransceiver:
+            remote_name = "sync-one-way"
+
+            def transceive(self, request):
+                return responder.respond(request)
+
+        requestor = avro.ipc.Requestor(ONE_WAY_PROTOCOL, MemoryTransceiver())
+        self.assertIsNone(requestor.request("ack", {}))
+        self.assertIsNone(requestor.request("ack", {}))
 
     def test_server_with_path(self):
         client_with_custom_path = avro.ipc.HTTPTransceiver("apache.org", 80, "/service/article")

@@ -36,10 +36,16 @@ from avro.utils import TypedDict
 VALID_TYPE_SCHEMA_TYPES = ("enum", "record", "error", "fixed")
 
 
-class MessageObject(TypedDict, total=False):
-    request: Sequence[Mapping[str, object]]
-    response: Union[str, object]
-    errors: Optional[Sequence[str]]
+MessageObject = TypedDict(
+    "MessageObject",
+    {
+        "request": Sequence[Mapping[str, object]],
+        "response": Union[str, object],
+        "errors": Optional[Sequence[str]],
+        "one-way": bool,
+    },
+    total=False,
+)
 
 
 class ProtocolObject(TypedDict, total=False):
@@ -171,7 +177,7 @@ class Message:
     The one-way parameter may only be true when the response type is "null" and no errors are listed.
     """
 
-    __slots__ = ["_errors", "_name", "_request", "_response", "_validate_names"]
+    __slots__ = ["_errors", "_name", "_one_way", "_request", "_response", "_validate_names"]
 
     def __init__(
         self,
@@ -181,6 +187,7 @@ class Message:
         errors: Optional[Sequence[str]] = None,
         names: Optional[avro.name.Names] = None,
         validate_names: bool = True,
+        one_way: bool = False,
     ) -> None:
         self._name = name
         names = names or avro.name.Names(validate_names=validate_names)
@@ -188,6 +195,7 @@ class Message:
         self._response = _parse_response(response, names, validate_names)
         self._errors = _parse_errors(errors or [], names, validate_names)
         self._validate_names = validate_names
+        self._one_way = one_way
 
     @property
     def name(self) -> str:
@@ -205,6 +213,10 @@ class Message:
     def errors(self) -> avro.schema.ErrorUnionSchema:
         return self._errors
 
+    @property
+    def one_way(self) -> bool:
+        return self._one_way
+
     def __str__(self) -> str:
         return json.dumps(self.to_json())
 
@@ -219,6 +231,8 @@ class Message:
         to_dump["response"] = self.response.to_json(names)
         if self.errors:
             to_dump["errors"] = self.errors.to_json(names)
+        if self.one_way:
+            to_dump["one-way"] = True
 
         return to_dump
 
@@ -283,5 +297,11 @@ def _parse_messages(message_objects: Mapping[str, "MessageObject"], names: avro.
         request = body["request"]
         response = body["response"]
         errors = body.get("errors")
-        messages[name] = Message(name, request, response, errors, names, validate_names=validate_names)
+        one_way = body.get("one-way", False)
+        if not isinstance(one_way, bool):
+            raise avro.errors.ProtocolParseException(f'Message "{name}" has non-boolean one-way value: {one_way}')
+        message = Message(name, request, response, errors, names, validate_names=validate_names, one_way=one_way)
+        if one_way and (message.response.type != "null" or errors):
+            raise avro.errors.ProtocolParseException(f'Message "{name}" is declared one-way but has a non-null response or declared errors.')
+        messages[name] = message
     return messages
