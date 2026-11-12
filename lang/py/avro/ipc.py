@@ -280,12 +280,17 @@ class Responder:
         buffer_encoder = avro.io.BinaryEncoder(buffer_writer)
         error = None
         response_metadata = {}
+        # End of the handshake response in the output buffer. A system error
+        # truncates the buffer back to this point so the requestor still
+        # receives a valid handshake followed by the error.
+        handshake_length = 0
 
         try:
             remote_protocol = self.process_handshake(buffer_decoder, buffer_encoder)
             # handshake failure
             if remote_protocol is None:
                 return buffer_writer.getvalue()
+            handshake_length = buffer_writer.tell()
 
             # read request using remote protocol
             META_READER.read(buffer_decoder)
@@ -324,7 +329,11 @@ class Responder:
                 self.write_error(writers_schema, error, buffer_encoder)
         except avro.errors.AvroException as e:
             error = avro.errors.AvroRemoteException(str(e))
-            buffer_encoder = avro.io.BinaryEncoder(io.BytesIO())
+            # Drop any partially written call response, keeping the handshake
+            # so the requestor can complete the handshake before reading the
+            # system error.
+            buffer_writer.seek(handshake_length)
+            buffer_writer.truncate()
             META_WRITER.write(response_metadata, buffer_encoder)
             buffer_encoder.write_boolean(True)
             self.write_error(SYSTEM_ERROR_SCHEMA, error, buffer_encoder)
@@ -376,8 +385,26 @@ class Responder:
         datum_writer.write(response_datum, encoder)
 
     def write_error(self, writers_schema, error_exception, encoder):
+        # An AvroRemoteException carries the value raised by the handler, so a
+        # declared error record can round-trip instead of being flattened into
+        # its string representation.
+        if isinstance(error_exception, avro.errors.AvroRemoteException) and len(error_exception.args) == 1:
+            error_datum = error_exception.args[0]
+        else:
+            error_datum = str(error_exception)
         datum_writer = avro.io.DatumWriter(writers_schema)
-        datum_writer.write(str(error_exception), encoder)
+        try:
+            # Serialize to a scratch buffer first: a datum that fails partway
+            # through (e.g. a record missing a field) must not leave partial
+            # bytes on the wire before the system-error fallback is written.
+            scratch_writer = io.BytesIO()
+            datum_writer.write(error_datum, avro.io.BinaryEncoder(scratch_writer))
+            encoder.write(scratch_writer.getvalue())
+        except avro.errors.AvroException:
+            # Every effective error union contains "string", so a value that
+            # does not fit a declared error branch still goes out as a system
+            # error.
+            datum_writer.write(str(error_exception), encoder)
 
 
 #
